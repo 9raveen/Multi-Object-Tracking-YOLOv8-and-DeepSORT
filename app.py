@@ -4,6 +4,7 @@ import os
 import tempfile
 import hashlib
 import torch
+import glob
 
 from src.detector import YOLODetector
 from src.tracker import Tracker
@@ -19,6 +20,27 @@ MAX_FRAMES      = 375   # 15 seconds at 25fps
 PROCESS_EVERY_N = 2     # process every 2nd frame
 RESIZE_WIDTH    = 640   # downscale for CPU speed
 
+# ── Find demo clip robustly ───────────────────────────────────────────────
+def find_demo_clip():
+    """Try all known HF Spaces paths to find demo_clip.mp4"""
+    candidates = [
+        "demo_clip.mp4",
+        "./demo_clip.mp4",
+        "/home/user/app/demo_clip.mp4",
+        "/app/demo_clip.mp4",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_clip.mp4"),
+    ]
+    # Also search recursively
+    found = glob.glob("**/demo_clip.mp4", recursive=True)
+    candidates += found
+
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+DEMO_CLIP_PATH = find_demo_clip()
+
 # ── Helpers ───────────────────────────────────────────────────────────────
 def get_fallback_color(track_id):
     h = int(hashlib.md5(str(track_id).encode()).hexdigest(), 16)
@@ -28,17 +50,15 @@ def get_fallback_color(track_id):
     return (b, g, r)
 
 def resize_frame(frame, target_width=RESIZE_WIDTH):
-    """Downscale frame for faster CPU inference."""
     h, w = frame.shape[:2]
     if w <= target_width:
         return frame, 1.0
-    scale  = target_width / w
-    new_h  = int(h * scale)
+    scale   = target_width / w
+    new_h   = int(h * scale)
     resized = cv2.resize(frame, (target_width, new_h))
     return resized, scale
 
 def scale_tracks_up(tracks, scale):
-    """Scale bounding boxes back to original resolution."""
     if scale == 1.0:
         return tracks
     scaled = []
@@ -51,114 +71,10 @@ def scale_tracks_up(tracks, scale):
         ])
     return scaled
 
-# ── Pipeline ──────────────────────────────────────────────────────────────
-def run_tracking(video_path, conf_threshold, max_det, progress=gr.Progress()):
-    if video_path is None:
-        return None, "❌ Please upload a video first."
-
-    # Use yolov8n for CPU speed
-    detector        = YOLODetector(model_path="yolov8n.pt",
-                                   conf_threshold=float(conf_threshold))
-    tracker         = Tracker(max_age=60, n_init=5)
-    team_classifier = TeamClassifier(update_interval=10)
-    scene_detector  = SceneChangeDetector(threshold=35.0)
-    track_history   = {}
-
-    # Force CPU
-    detector.model.to("cpu")
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return None, "❌ Could not open video."
-
-    fps    = cap.get(cv2.CAP_PROP_FPS) or 25
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total  = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), MAX_FRAMES)
-
-    tmp_out  = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    out_path = tmp_out.name
-    tmp_out.close()
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out    = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
-
-    frame_idx   = 0
-    scene_cuts  = 0
-    last_tracks = []
-    max_det     = int(max_det)
-
-    while frame_idx < total:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame_idx += 1
-        progress(frame_idx / total,
-                 desc=f"Processing frame {frame_idx}/{total}...")
-
-        # Scene change on full frame
-        if scene_detector.is_scene_change(frame):
-            tracker         = Tracker(max_age=60, n_init=5)
-            track_history   = {}
-            last_tracks     = []
-            team_classifier.reset()
-            scene_cuts += 1
-            out.write(frame)
-            continue
-
-        # Skip every 2nd frame — reuse last tracks
-        if frame_idx % PROCESS_EVERY_N != 0:
-            annotated = draw(frame, last_tracks, track_history,
-                             team_classifier, frame_idx, total, scene_cuts)
-            out.write(annotated)
-            continue
-
-        # Downscale for inference
-        small_frame, scale = resize_frame(frame)
-
-        # Detect on small frame
-        detections, crops = detector.detect(small_frame)
-
-        if len(detections) > max_det:
-            detections = detections[:max_det]
-            crops      = crops[:max_det]
-
-        # Track on small frame
-        tracks_small = tracker.update(detections, small_frame)
-
-        # Scale boxes back up to original resolution
-        tracks = scale_tracks_up(tracks_small, scale)
-
-        # Team classify
-        team_map = team_classifier.classify_by_crops(
-            tracks_small, detections, crops, frame_idx)
-
-        last_tracks = tracks
-
-        # Clean history
-        active_ids    = set(t[4] for t in tracks)
-        track_history = {tid: pts for tid, pts in track_history.items()
-                         if tid in active_ids}
-
-        annotated = draw(frame, tracks, track_history,
-                         team_classifier, frame_idx, total, scene_cuts)
-        out.write(annotated)
-
-    cap.release()
-    out.release()
-
-    stats = (f"✅ Done! {frame_idx} frames processed | "
-             f"Scene cuts: {scene_cuts} | "
-             f"Tip: processing capped at {MAX_FRAMES} frames (~15 sec).")
-    return out_path, stats
-
-
+# ── Draw function ─────────────────────────────────────────────────────────
 def draw(frame, tracks, track_history, team_classifier,
          frame_idx, total, scene_cuts):
-    """Draw annotations on frame."""
     annotated = frame.copy()
-    h_frame   = frame.shape[0]
 
     for track in tracks:
         x1, y1, x2, y2, track_id = track
@@ -172,7 +88,6 @@ def draw(frame, tracks, track_history, team_classifier,
         if box_w > 200 or box_h > 250 or box_w < 15:
             continue
 
-        track_id_str = str(track_id)
         if track_id not in team_classifier.team_assignments:
             color = get_fallback_color(track_id)
             team  = "Detecting..."
@@ -180,7 +95,7 @@ def draw(frame, tracks, track_history, team_classifier,
             color = team_classifier.get_team_color(track_id)
             team  = team_classifier.team_assignments[track_id]
 
-        # Box
+        # Bounding box
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
 
         # Label
@@ -203,7 +118,7 @@ def draw(frame, tracks, track_history, team_classifier,
             track_history[track_id].pop(0)
         for i in range(1, len(track_history[track_id])):
             cv2.line(annotated,
-                     track_history[track_id][i-1],
+                     track_history[track_id][i - 1],
                      track_history[track_id][i],
                      color, 2)
 
@@ -215,18 +130,130 @@ def draw(frame, tracks, track_history, team_classifier,
                 0.65, (255, 255, 255), 2)
     return annotated
 
+# ── Main pipeline ─────────────────────────────────────────────────────────
+def run_tracking(video_path, conf_threshold, max_det,
+                 progress=gr.Progress()):
 
-# ── Gradio UI ──────────────────────────────────────────────────────────────
-with gr.Blocks(title="Sports Player Tracker", theme=gr.themes.Soft()) as demo:
+    if video_path is None:
+        return None, "❌ Please upload a video first."
+
+    if not os.path.exists(video_path):
+        return None, f"❌ Video not found at: {video_path}"
+
+    detector        = YOLODetector(model_path="yolov8n.pt",
+                                   conf_threshold=float(conf_threshold))
+    tracker         = Tracker(max_age=60, n_init=5)
+    team_classifier = TeamClassifier(update_interval=10)
+    scene_detector  = SceneChangeDetector(threshold=35.0)
+    track_history   = {}
+
+    detector.model.to("cpu")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None, "❌ Could not open video."
+
+    fps    = cap.get(cv2.CAP_PROP_FPS) or 25
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total  = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), MAX_FRAMES)
+
+    if total == 0:
+        return None, "❌ Video has 0 readable frames. Try re-uploading."
+
+    tmp_out  = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    out_path = tmp_out.name
+    tmp_out.close()
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out    = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+
+    frame_idx   = 0
+    scene_cuts  = 0
+    last_tracks = []
+    max_det     = int(max_det)
+
+    while frame_idx < total:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_idx += 1
+        progress(frame_idx / total,
+                 desc=f"Processing frame {frame_idx}/{total}...")
+
+        # Scene change check
+        if scene_detector.is_scene_change(frame):
+            tracker         = Tracker(max_age=60, n_init=5)
+            track_history   = {}
+            last_tracks     = []
+            team_classifier.reset()
+            scene_cuts += 1
+            out.write(frame)
+            continue
+
+        # Skip every 2nd frame
+        if frame_idx % PROCESS_EVERY_N != 0:
+            annotated = draw(frame, last_tracks, track_history,
+                             team_classifier, frame_idx, total, scene_cuts)
+            out.write(annotated)
+            continue
+
+        # Downscale for inference
+        small_frame, scale = resize_frame(frame)
+
+        # Detect
+        detections, crops, ball = detector.detect(small_frame)
+        if len(detections) > max_det:
+            detections = detections[:max_det]
+            crops      = crops[:max_det]
+
+        # Track
+        tracks_small = tracker.update(detections, small_frame)
+        tracks       = scale_tracks_up(tracks_small, scale)
+
+        # Team classify
+        team_classifier.classify_by_crops(
+            tracks_small, detections, crops, frame_idx)
+
+        last_tracks = tracks
+
+        # Clean history
+        active_ids    = set(t[4] for t in tracks)
+        track_history = {tid: pts for tid, pts in track_history.items()
+                         if tid in active_ids}
+
+        annotated = draw(frame, tracks, track_history,
+                         team_classifier, frame_idx, total, scene_cuts)
+        out.write(annotated)
+
+    cap.release()
+    out.release()
+
+    stats = (f"✅ Done! {frame_idx} frames processed | "
+             f"Scene cuts: {scene_cuts} | "
+             f"Capped at {MAX_FRAMES} frames (~15 sec).")
+    return out_path, stats
+
+
+# ── Demo runner ───────────────────────────────────────────────────────────
+def run_demo(conf, maxdet, progress=gr.Progress()):
+    if DEMO_CLIP_PATH is None:
+        return None, "❌ demo_clip.mp4 not found on server. Please use Upload tab."
+    return run_tracking(DEMO_CLIP_PATH, conf, maxdet, progress)
+
+
+# ── Gradio UI ─────────────────────────────────────────────────────────────
+with gr.Blocks(title="Sports Player Tracker") as demo:
 
     gr.Markdown("""
     # ⚽ Multi-Object Player Tracking
     **YOLOv8n + DeepSORT | Team Classification | Trajectory Visualization**
 
-    Upload a sports video clip. The pipeline detects players, assigns persistent IDs,
-    classifies teams by jersey color, and draws movement trails.
+    Detects players, assigns persistent IDs, classifies teams by jersey color,
+    and draws movement trails.
 
-    > ⏱️ CPU processing — ~3-5 FPS. Best with clips under 15 seconds.
+    > ⏱️ CPU processing — ~3-5 FPS. Best with clips under **15 seconds**.
     """)
 
     with gr.Tabs():
@@ -234,9 +261,9 @@ with gr.Blocks(title="Sports Player Tracker", theme=gr.themes.Soft()) as demo:
         # ── Tab 1: Upload ──────────────────────────────────────────────
         with gr.TabItem("📤 Upload Your Video"):
             gr.Markdown("""
-            Upload any broadcast sports clip. Wide-angle shots with
-            multiple players work best. Keep clips under **15 seconds**
-            for reasonable processing time.
+            Upload any broadcast sports clip.
+            Wide-angle shots with multiple players work best.
+            Keep clips under **15 seconds** for reasonable processing time.
             """)
             with gr.Row():
                 with gr.Column(scale=1):
@@ -268,18 +295,17 @@ with gr.Blocks(title="Sports Player Tracker", theme=gr.themes.Soft()) as demo:
                 outputs=[out_upload, stat_upload]
             )
 
-        # ── Tab 2: Demo Clip ───────────────────────────────────────────
+        # ── Tab 2: Demo ────────────────────────────────────────────────
         with gr.TabItem("🎬 Try Demo Clip"):
             gr.Markdown("""
-            Pre-loaded FA Cup 2024 clip — Manchester City vs Manchester United.
+            Pre-loaded FA Cup 2024 clip —
+            Manchester City vs Manchester United, Wembley Stadium.
             Click **Run Demo** — no upload needed.
             """)
             with gr.Row():
                 with gr.Column(scale=1):
-                    demo_preview = gr.Video(
-                        value="demo_clip.mp4",
-                        label="Demo Clip (FA Cup 2024)",
-                        interactive=False
+                    gr.Markdown(
+                        f"**Demo clip path:** `{DEMO_CLIP_PATH or 'Not found'}`"
                     )
                     with gr.Accordion("⚙️ Settings", open=False):
                         conf_demo   = gr.Slider(
@@ -292,14 +318,15 @@ with gr.Blocks(title="Sports Player Tracker", theme=gr.themes.Soft()) as demo:
                             value=20, step=1,
                             label="Max Detections per Frame"
                         )
-                    run_demo_btn = gr.Button("▶ Run Demo", variant="primary")
+                    run_demo_btn = gr.Button(
+                        "▶ Run Demo", variant="primary"
+                    )
                 with gr.Column(scale=1):
                     out_demo  = gr.Video(label="Annotated Output")
                     stat_demo = gr.Textbox(label="Status", interactive=False)
 
             run_demo_btn.click(
-                fn=lambda conf, maxdet: run_tracking(
-                    "demo_clip.mp4", conf, maxdet),
+                fn=run_demo,
                 inputs=[conf_demo, maxdet_demo],
                 outputs=[out_demo, stat_demo]
             )
@@ -313,9 +340,8 @@ with gr.Blocks(title="Sports Player Tracker", theme=gr.themes.Soft()) as demo:
     | Team Classification | HSV K-Means | Jersey color clustering |
     | Scene Detection | Frame diff | Tracker reset on camera cuts |
 
-    **Source:** [GitHub](https://github.com/your-username/multi-object-tracking) |
-    **Video:** [FA Cup 2024](https://youtu.be/X0we8220k74)
+    **Source code:** [GitHub](https://github.com/your-username/multi-object-tracking) |
+    **Video source:** [FA Cup 2024](https://youtu.be/X0we8220k74)
     """)
 
-demo.launch(server_name="0.0.0.0", server_port=7860)
-
+demo.launch(server_name="127.0.0.1", server_port=7860, theme=gr.themes.Soft())
